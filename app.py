@@ -1,97 +1,90 @@
-import streamlit as st
 import cv2
-import torch
-from transformers import BlipProcessor, BlipForConditionalGeneration, pipeline
-import tempfile
 import os
+import spacy
+from transformers import (
+    AutoProcessor, AutoModelForImageTextToText,
+    AutoTokenizer, AutoModelForSeq2SeqLM
+)
+import streamlit as st
 
-# Load YOLOv8 model (assuming ultralytics library is used)
-yolo_model = torch.hub.load('ultralytics/yolov8', 'yolov8')
+# Streamlit app title
+st.title("Video Summarization Tool with Frame-wise Summaries")
 
-# Load Florence model from Microsoft
-blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+# Load models
+@st.cache_resource
+def load_models():
+    processor = AutoProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+    blip_model = AutoModelForImageTextToText.from_pretrained("Salesforce/blip-image-captioning-large")
+    flan_t5_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-xxl")
+    flan_t5_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-xxl")
+    bert_nlp = spacy.load("en_core_web_sm")
+    return processor, blip_model, flan_t5_tokenizer, flan_t5_model, bert_nlp
 
-# Initialize a summarization pipeline
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+processor, blip_model, flan_t5_tokenizer, flan_t5_model, bert_nlp = load_models()
 
-# Function to process video and get frames
-def process_video(video_path):
+# Process video and extract frames
+def process_video(video_path, frame_skip=5):
     cap = cv2.VideoCapture(video_path)
-    frame_count = 0
     frames = []
+    frame_count = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
-        if frame_count % 5 == 0:
+        if frame_count % frame_skip == 0:
             frames.append(frame)
         frame_count += 1
 
     cap.release()
     return frames
 
-# Function to analyze frames
-def analyze_frames(frames):
-    transcriptions = []
-    for frame in frames:
-        # YOLOv8 detection (This part is optional, as we focus on visual understanding)
-        results_yolo = yolo_model(frame)
-        detections = results_yolo.pandas().xyxy[0]
+# Transcribe a single frame using BLIP
+def transcribe_frame(frame):
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    inputs = processor(images=frame_rgb, return_tensors="pt")
+    output = blip_model.generate(**inputs)
+    return processor.decode(output[0], skip_special_tokens=True)
 
-        # Convert frame to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+# Correct sentence using BERT-based NLP model
+def correct_sentence(text):
+    doc = bert_nlp(text)
+    return " ".join([token.text for token in doc])
 
-        # Florence description
-        inputs = blip_processor(images=frame_rgb, return_tensors="pt")
-        out = blip_model.generate(**inputs)
-        caption = blip_processor.decode(out[0], skip_special_tokens=True)
-
-        transcriptions.append(caption)
-
-    # Combine transcriptions into a single text
-    combined_transcription = " ".join(transcriptions)
-    return combined_transcription
-
-# Streamlit app
-st.title("Video to Text Summary Tool")
-st.write("Upload a video file to analyze its content and generate a summary.")
+# Summarize text using Flan-T5
+def summarize_text_with_flan_t5(text, max_length=200, min_length=50):
+    inputs = flan_t5_tokenizer(text, return_tensors="pt", truncation=True, padding="longest")
+    summary_ids = flan_t5_model.generate(inputs.input_ids, max_length=max_length, min_length=min_length, num_beams=5)
+    return flan_t5_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
 
 # Upload video file
-uploaded_file = st.file_uploader("Upload your video file", type=["mp4", "mov", "avi", "mkv"])
+uploaded_file = st.file_uploader("Upload a video file", type=["mp4", "avi", "mov"])
 
 if uploaded_file is not None:
-    # Save the uploaded video file
-    temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_video_file.write(uploaded_file.read())
-    video_path = temp_video_file.name
+    with open("temp_video.mp4", "wb") as f:
+        f.write(uploaded_file.read())
 
-    # Display video
-    st.video(video_path)
+    # Step 1: Process video into frames
+    frames = process_video("temp_video.mp4")
 
-    # Process video to get frames
-    st.write("### Step 1: Processing Video")
-    with st.spinner("Processing video and extracting frames..."):
-        frames = process_video(video_path)
-    st.success("Frames extracted successfully!")
+    # Step 2: Generate and display frame-wise summaries
+    st.write("Processing frames and generating summaries...")
+    frame_summaries = []
 
-    # Analyze frames
-    st.write("### Step 2: Analyzing Frames")
-    with st.spinner("Analyzing frames..."):
-        combined_transcription = analyze_frames(frames)
-    st.success("Frames analyzed successfully!")
+    for idx, frame in enumerate(frames):
+        transcription = transcribe_frame(frame)
+        corrected_transcription = correct_sentence(transcription)
+        frame_summaries.append(corrected_transcription)
+        st.subheader(f"Frame {idx + 1}:")
+        st.write(corrected_transcription)
 
-    # Generate video summary
-    st.write("### Step 3: Generating Summary")
-    with st.spinner("Summarizing the video..."):
-        summary_result = summarizer(combined_transcription, max_length=150, min_length=40, do_sample=False)
-        video_summary = summary_result[0]['summary_text']
+    # Step 3: Combine frame summaries
+    combined_text = " ".join(frame_summaries)
 
-    st.write("#### Video Summary:")
-    st.text_area("Summary", video_summary, height=150)
+    # Step 4: Generate overall summary using Flan-T5
+    st.write("Generating overall summary...")
+    overall_summary = summarize_text_with_flan_t5(combined_text)
 
-    # Cleanup temporary file
-    os.remove(video_path)
-    st.success("Process completed successfully!")
+    # Display results
+    st.subheader("Overall Video Summary")
+    st.write(overall_summary)
